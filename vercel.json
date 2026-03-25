@@ -3,17 +3,7 @@
   "builds": [
     {
       "src": "apps/web/package.json",
-      "use": "@vercel/next",
-      "config": {
-        "maxLambdaSize": "50mb"
-      }
+      "use": "@vercel/next"
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "apps/web/$1"
-    }
-  ],
-  "outputDirectory": "apps/web/.next"
+  ]
 }
