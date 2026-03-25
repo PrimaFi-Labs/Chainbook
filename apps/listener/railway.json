@@ -1,10 +1,11 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "buildCommand": "pnpm install && pnpm --filter @chainbook/listener build"
   },
   "deploy": {
-    "startCommand": "pnpm start",
+    "startCommand": "pnpm --filter @chainbook/listener start",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
