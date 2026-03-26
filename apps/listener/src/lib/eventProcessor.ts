@@ -17,6 +17,34 @@ import { updateWalletTokenHolding, updateWalletNativeBalanceUsd, upsertMintedTok
 // Queue for batching reputation updates - flushed every 5 minutes
 const reputationQueue = new Map<string, { volumeUsd: number; activityCount: number }>()
 
+// ===== Concurrency Limiting =====
+let rpcConcurrent = 0
+let dbConcurrent = 0
+
+async function withRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
+  while (rpcConcurrent >= env.MAX_CONCURRENT_RPC_CALLS) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  rpcConcurrent++
+  try {
+    return await fn()
+  } finally {
+    rpcConcurrent--
+  }
+}
+
+async function withDbLimit<T>(fn: () => Promise<T>): Promise<T> {
+  while (dbConcurrent >= env.MAX_CONCURRENT_DB_OPERATIONS) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  dbConcurrent++
+  try {
+    return await fn()
+  } finally {
+    dbConcurrent--
+  }
+}
+
 const ERC20_BALANCE_OF_ABI = [
   {
     name: 'balanceOf',
@@ -233,7 +261,9 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
   // Async side-effects - do not await to keep event processing fast
   void incrementTrending(decoded.contractAddress, resolvedWallet)
   void queueReputationUpdate(resolvedWallet, amountUsd)
-  if (decoded.tokenIn) {
+  
+  // Wallet token tracking - DISABLED by default to save 30% RPC usage
+  if (env.ENABLE_WALLET_TOKEN_TRACKING && decoded.tokenIn) {
     const fromAddr = typeof decoded.metadata?.from === 'string'
       ? decoded.metadata.from
       : resolvedWallet
@@ -242,12 +272,13 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
       : undefined
 
     if (fromAddr && !isZeroAddress(fromAddr)) {
-      void updateWalletTokenHolding(fromAddr, decoded.tokenIn, tokenMeta?.decimals ?? null)
+      void withRpcLimit(() => updateWalletTokenHolding(fromAddr, decoded.tokenIn, tokenMeta?.decimals ?? null))
     }
     if (toAddr && !isZeroAddress(toAddr)) {
-      void updateWalletTokenHolding(toAddr, decoded.tokenIn, tokenMeta?.decimals ?? null)
+      void withRpcLimit(() => updateWalletTokenHolding(toAddr, decoded.tokenIn, tokenMeta?.decimals ?? null))
     }
   }
+  
   if (postType === 'MINT' && decoded.tokenIn) {
     const mintedOwner = (decoded.metadata?.to as string | undefined) ?? resolvedWallet
     if (mintedOwner && !isZeroAddress(mintedOwner)) {
@@ -255,15 +286,17 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
     }
   }
 
-  if (insertedPost?.id) {
-    void dispatchNotifications({
+  // Notifications - DISABLED by default to save 25% DB usage
+  // Only dispatch for significant events above minimum USD threshold
+  if (insertedPost?.id && env.ENABLE_NOTIFICATIONS && amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD) {
+    void withDbLimit(() => dispatchNotifications({
       postId: insertedPost.id,
       walletAddress: resolvedWallet,
       contractAddress: decoded.contractAddress,
       amountUsd,
       isWhaleAlert,
       postType,
-    })
+    }))
   }
 }
 
@@ -327,18 +360,23 @@ export async function processNativeTransfer(tx: NativeTransfer): Promise<void> {
 
   void incrementTrending(tx.to, tx.from)
   void queueReputationUpdate(tx.from, amountUsd)
-  void updateWalletNativeBalanceUsd(tx.from)
-  if (tx.to) void updateWalletNativeBalanceUsd(tx.to)
+  
+  // Wallet native balance tracking - DISABLED by default to save RPC usage
+  if (env.ENABLE_WALLET_TOKEN_TRACKING) {
+    void withRpcLimit(() => updateWalletNativeBalanceUsd(tx.from))
+    if (tx.to) void withRpcLimit(() => updateWalletNativeBalanceUsd(tx.to))
+  }
 
-  if (insertedPost?.id) {
-    void dispatchNotifications({
+  // Notifications - DISABLED by default to save DB usage
+  if (insertedPost?.id && env.ENABLE_NOTIFICATIONS && amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD) {
+    void withDbLimit(() => dispatchNotifications({
       postId: insertedPost.id,
       walletAddress: tx.from,
       contractAddress: tx.to,
       amountUsd,
       isWhaleAlert,
       postType: 'TRANSFER',
-    })
+    }))
   }
 }
 

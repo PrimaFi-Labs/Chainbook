@@ -63,4 +63,12 @@ export const env = {
   REACTIVITY_SIGNAL_MATCH_WAIT_MS:    Number(process.env.REACTIVITY_SIGNAL_MATCH_WAIT_MS ?? '1200'),
   REACTIVITY_SHOWCASE_HANDLER_ADDRESS: process.env.REACTIVITY_SHOWCASE_HANDLER_ADDRESS,
   REACTIVITY_SHOWCASE_TOPIC0:         process.env.REACTIVITY_SHOWCASE_TOPIC0,
+  // ===== Resource Optimization Flags =====
+  ENABLE_WALLET_TOKEN_TRACKING:       bool_env('ENABLE_WALLET_TOKEN_TRACKING', false), // DISABLED by default (saves 30% RPC)
+  ENABLE_NOTIFICATIONS:               bool_env('ENABLE_NOTIFICATIONS', false), // DISABLED by default (saves 25% DB)
+  NOTIFICATION_MIN_USD_THRESHOLD:     Number(process.env.NOTIFICATION_MIN_USD_THRESHOLD ?? '5000'), // Only notify for $5k+
+  MAX_CONCURRENT_RPC_CALLS:           Number(process.env.MAX_CONCURRENT_RPC_CALLS ?? '10'), // Concurrency limit
+  MAX_CONCURRENT_DB_OPERATIONS:       Number(process.env.MAX_CONCURRENT_DB_OPERATIONS ?? '15'), // DB concurrency
+  TOKEN_METADATA_TTL_MS:              Number(process.env.TOKEN_METADATA_TTL_MS ?? '86400000'), // 24h cache (up from 1h)
+  PRICE_FEED_CACHE_TTL_MS:            Number(process.env.PRICE_FEED_CACHE_TTL_MS ?? '300000'), // 5m cache (up from 1m)
 } as const

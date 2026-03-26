@@ -12,7 +12,6 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>()
-const TTL_MS = 60_000 // 1 minute
 
 const DIA_ADAPTER_ABI = [
   {
@@ -59,25 +58,25 @@ async function fetchPrice(coinId: string): Promise<number> {
     if (!res.ok) {
       const oracle = await fetchOraclePrice()
       if (oracle > 0) {
-        cache.set(coinId, { price: oracle, expiresAt: now + TTL_MS })
+        cache.set(coinId, { price: oracle, expiresAt: now + env.PRICE_FEED_CACHE_TTL_MS })
       }
       return oracle
     }
     const json = (await res.json()) as Record<string, { usd: number }>
     const price = json[coinId]?.usd ?? 0
     if (price > 0) {
-      cache.set(coinId, { price, expiresAt: now + TTL_MS })
+      cache.set(coinId, { price, expiresAt: now + env.PRICE_FEED_CACHE_TTL_MS })
       return price
     }
     const oracle = await fetchOraclePrice()
     if (oracle > 0) {
-      cache.set(coinId, { price: oracle, expiresAt: now + TTL_MS })
+      cache.set(coinId, { price: oracle, expiresAt: now + env.PRICE_FEED_CACHE_TTL_MS })
     }
     return oracle
   } catch {
     const oracle = await fetchOraclePrice()
     if (oracle > 0) {
-      cache.set(coinId, { price: oracle, expiresAt: now + TTL_MS })
+      cache.set(coinId, { price: oracle, expiresAt: now + env.PRICE_FEED_CACHE_TTL_MS })
     }
     return oracle
   }

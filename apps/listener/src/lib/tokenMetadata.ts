@@ -48,6 +48,20 @@ const ERC721_INTERFACE_ID = '0x80ac58cd'
 
 const cache = new Map<string, { value: TokenMetadata; fetchedAt: number }>()
 
+// Simple concurrency limiter for RPC calls
+let metadataRpcConcurrent = 0
+async function withMetadataRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
+  while (metadataRpcConcurrent >= env.MAX_CONCURRENT_RPC_CALLS) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  metadataRpcConcurrent++
+  try {
+    return await fn()
+  } finally {
+    metadataRpcConcurrent--
+  }
+}
+
 function isStale(updatedAt: string): boolean {
   const last = new Date(updatedAt).getTime()
   return Number.isNaN(last) || (Date.now() - last) > env.TOKEN_METADATA_TTL_MS
@@ -109,7 +123,7 @@ export async function getTokenMetadata(address?: string | null): Promise<TokenMe
     return value
   }
 
-  const onChain = await fetchOnChain(addr as Hex)
+  const onChain = await withMetadataRpcLimit(() => fetchOnChain(addr as Hex))
   if (!onChain) return existing ?? null
 
   await supabase
