@@ -1,4 +1,5 @@
-//apps/listener/src/lib/tokenMetadata.ts
+// apps/listener/src/lib/tokenMetadata.ts
+
 import { supabase } from '../config/supabase.js'
 import { publicClientHttp } from '../config/chain.js'
 import { env } from '../config/env.js'
@@ -48,11 +49,10 @@ const ERC721_INTERFACE_ID = '0x80ac58cd'
 
 const cache = new Map<string, { value: TokenMetadata; fetchedAt: number }>()
 
-// Simple concurrency limiter for RPC calls
 let metadataRpcConcurrent = 0
 async function withMetadataRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
   while (metadataRpcConcurrent >= env.MAX_CONCURRENT_RPC_CALLS) {
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 10))
   }
   metadataRpcConcurrent++
   try {
@@ -64,7 +64,7 @@ async function withMetadataRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
 
 function isStale(updatedAt: string): boolean {
   const last = new Date(updatedAt).getTime()
-  return Number.isNaN(last) || (Date.now() - last) > env.TOKEN_METADATA_TTL_MS
+  return Number.isNaN(last) || Date.now() - last > env.TOKEN_METADATA_TTL_MS
 }
 
 async function fetchOnChain(address: Hex): Promise<TokenMetadata | null> {
@@ -107,7 +107,7 @@ export async function getTokenMetadata(address?: string | null): Promise<TokenMe
   const addr = address.toLowerCase()
 
   const cached = cache.get(addr)
-  if (cached && (Date.now() - cached.fetchedAt) < env.TOKEN_METADATA_TTL_MS) {
+  if (cached && Date.now() - cached.fetchedAt < env.TOKEN_METADATA_TTL_MS) {
     return cached.value
   }
 

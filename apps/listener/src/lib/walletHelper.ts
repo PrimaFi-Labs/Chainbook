@@ -2,11 +2,34 @@
 
 import { supabase } from '../config/supabase.js'
 
+// ─── In-memory wallet dedup cache ─────────────────────────────────────────────
+// ensureWallet is called for every single event processed. Without a cache,
+// this means one Supabase upsert per event even for wallets we wrote minutes
+// ago. The knownWallets Set tracks addresses upserted this session so repeat
+// calls are a cheap Set.has() instead of a network round-trip.
+//
+// Cap at 50k entries (~4–5 MB). On overflow we clear the whole set — entries
+// are cheap to re-verify once per session on the next call.
+const WALLET_CACHE_MAX = 50_000
+const knownWallets = new Set<string>()
+
+function markWalletKnown(address: string): void {
+  if (knownWallets.size >= WALLET_CACHE_MAX) {
+    knownWallets.clear()
+  }
+  knownWallets.add(address)
+}
+
 export async function ensureWallet(address: string): Promise<void> {
   if (!address || address === '0x0000000000000000000000000000000000000000') return
 
+  const addr = address.toLowerCase()
+
+  // Skip DB call entirely for wallets already confirmed this session
+  if (knownWallets.has(addr)) return
+
   const payload = {
-    address: address.toLowerCase(),
+    address: addr,
     updated_at: new Date().toISOString(),
   }
 
@@ -16,7 +39,11 @@ export async function ensureWallet(address: string): Promise<void> {
         .from('wallets')
         .upsert(payload, { onConflict: 'address', ignoreDuplicates: true })
 
-      if (!error) return
+      if (!error) {
+        markWalletKnown(addr)
+        return
+      }
+
       if (!error.message.toLowerCase().includes('fetch failed') || attempt === 3) {
         console.error(`[WalletUpsert] Failed for ${address}:`, error.message)
         return
@@ -38,7 +65,6 @@ export async function incrementWalletStats(
   volumeUsd: number,
 ): Promise<void> {
   if (!address) return
-
   await supabase.rpc('increment_wallet_stats', {
     p_address: address.toLowerCase(),
     p_volume_usd: volumeUsd,

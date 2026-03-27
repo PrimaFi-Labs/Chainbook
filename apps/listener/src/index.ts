@@ -1,7 +1,7 @@
 // apps/listener/src/index.ts
 
 import { SDK } from '@somnia-chain/reactivity'
-import { keccak256, toHex, type Hex } from 'viem'
+import { type Hex } from 'viem'
 import { publicClientWs, publicClientHttp, publicClientReactivityWs } from './config/chain.js'
 import { processEvent, processNativeTransfer, processContractDeploy } from './lib/eventProcessor.js'
 import { startTrendingFlushInterval } from './lib/trendingEngine.js'
@@ -19,6 +19,7 @@ import {
   WHALE_DETECTED_TOPIC,
 } from './lib/eventSignatures.js'
 import { env } from './config/env.js'
+import { startKeepAliveServer } from './lib/keepAlive.js'
 
 interface ReactivityNotification {
   topics: Hex[]
@@ -51,6 +52,39 @@ type SignalBucket = {
 const REACTIVITY_SIGNAL_TTL_MS = 120_000
 const reactivitySignalBuckets = new Map<string, SignalBucket>()
 
+// ─── Block deduplication ─────────────────────────────────────────────────────
+// watchBlocks and the poll interval both call processBlockNumber. Without dedup
+// the same block is processed twice every poll cycle, doubling RPC + DB cost.
+// We record each processed block with a timestamp and skip re-processing within
+// the dedup TTL window.
+const BLOCK_DEDUP_TTL_MS = env.LISTENER_BLOCK_DEDUP_TTL_MS ?? 30_000
+const processedBlocks = new Map<string, number>()
+let lastBlockDedupCleanup = 0
+
+function markBlockProcessed(blockNumber: bigint): void {
+  const key = blockNumber.toString()
+  processedBlocks.set(key, Date.now())
+  const now = Date.now()
+  if (now - lastBlockDedupCleanup > 60_000) {
+    lastBlockDedupCleanup = now
+    const cutoff = now - BLOCK_DEDUP_TTL_MS * 2
+    for (const [k, ts] of processedBlocks.entries()) {
+      if (ts < cutoff) processedBlocks.delete(k)
+    }
+  }
+}
+
+function isBlockAlreadyProcessed(blockNumber: bigint): boolean {
+  const key = blockNumber.toString()
+  const ts = processedBlocks.get(key)
+  if (!ts) return false
+  if (Date.now() - ts > BLOCK_DEDUP_TTL_MS) {
+    processedBlocks.delete(key)
+    return false
+  }
+  return true
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -68,15 +102,6 @@ function parseConfiguredEthCalls(): Array<{ to: Hex; data: Hex }> {
     console.error('[Main] Failed to parse REACTIVITY_ETH_CALLS_JSON:', error)
     return []
   }
-}
-
-function chunkTopics(topics: Hex[], size: number): Hex[][] {
-  if (topics.length === 0) return []
-  const out: Hex[][] = []
-  for (let i = 0; i < topics.length; i += size) {
-    out.push(topics.slice(i, i + size))
-  }
-  return out
 }
 
 function sanitizeAddressList(values: string[]): Hex[] {
@@ -118,9 +143,7 @@ async function subscribeSafe(
   return null
 }
 
-function eventFingerprint(
-  input: { topics: Hex[]; data: Hex },
-): string {
+function eventFingerprint(input: { topics: Hex[]; data: Hex }): string {
   return [
     ...input.topics.map((topic) => topic.toLowerCase()),
     input.data.toLowerCase(),
@@ -131,29 +154,29 @@ function maybeCleanupReactivitySignals(now: number) {
   if (now - lastSignalCleanupAt < 15_000) return
   lastSignalCleanupAt = now
   for (const [fingerprint, bucket] of reactivitySignalBuckets.entries()) {
-    if (bucket.expiresAt <= now || (bucket.wildcard.length === 0 && bucket.spotlight.length === 0)) {
+    if (
+      bucket.expiresAt <= now ||
+      (bucket.wildcard.length === 0 && bucket.spotlight.length === 0)
+    ) {
       reactivitySignalBuckets.delete(fingerprint)
     }
   }
 }
 
-function recordReactivitySignal(event: ReactivityNotification, source: ReactivitySignalSource) {
+function recordReactivitySignal(
+  event: ReactivityNotification,
+  source: ReactivitySignalSource,
+) {
   const now = Date.now()
   maybeCleanupReactivitySignals(now)
-   const fingerprint = eventFingerprint({
-  topics: event.topics,
-  data: event.data,
-})
+  const fingerprint = eventFingerprint({ topics: event.topics, data: event.data })
   const bucket = reactivitySignalBuckets.get(fingerprint) ?? {
     wildcard: [],
     spotlight: [],
     expiresAt: now + REACTIVITY_SIGNAL_TTL_MS,
   }
   bucket.expiresAt = now + REACTIVITY_SIGNAL_TTL_MS
-  const signal: ReactivitySignal = {
-    source,
-    simulationResults: event.simulationResults,
-  }
+  const signal: ReactivitySignal = { source, simulationResults: event.simulationResults }
   if (source === 'reactivity_spotlight') {
     bucket.spotlight.push(signal)
   } else {
@@ -168,7 +191,6 @@ function consumeReactivitySignal(input: { topics: Hex[]; data: Hex }): Reactivit
   const fingerprint = eventFingerprint(input)
   const bucket = reactivitySignalBuckets.get(fingerprint)
   if (!bucket) return null
-
   const signal = bucket.spotlight.shift() ?? bucket.wildcard.shift() ?? null
   if (bucket.spotlight.length === 0 && bucket.wildcard.length === 0) {
     reactivitySignalBuckets.delete(fingerprint)
@@ -200,9 +222,10 @@ function normalizeNotification(data: unknown): ReactivityNotification | null {
   }
 
   for (const candidate of candidates) {
-    const nestedLog = (candidate.log && typeof candidate.log === 'object')
-      ? (candidate.log as Record<string, unknown>)
-      : null
+    const nestedLog =
+      candidate.log && typeof candidate.log === 'object'
+        ? (candidate.log as Record<string, unknown>)
+        : null
 
     const topicsRaw = candidate.topics ?? candidate.eventTopics ?? nestedLog?.topics
     const topics = Array.isArray(topicsRaw) ? (topicsRaw as Hex[]) : null
@@ -231,20 +254,22 @@ function normalizeNotification(data: unknown): ReactivityNotification | null {
       candidate.block_number ??
       nestedLog?.blockNumber ??
       nestedLog?.block_number
-    const blockNumber = typeof blockNumberRaw === 'bigint'
-      ? blockNumberRaw
-      : typeof blockNumberRaw === 'number'
-        ? BigInt(blockNumberRaw)
-        : typeof blockNumberRaw === 'string'
+    const blockNumber =
+      typeof blockNumberRaw === 'bigint'
+        ? blockNumberRaw
+        : typeof blockNumberRaw === 'number'
           ? BigInt(blockNumberRaw)
-          : null
+          : typeof blockNumberRaw === 'string'
+            ? BigInt(blockNumberRaw)
+            : null
 
     const logIndexRaw = candidate.logIndex ?? candidate.log_index ?? nestedLog?.logIndex
-    const logIndex = typeof logIndexRaw === 'number'
-      ? logIndexRaw
-      : typeof logIndexRaw === 'string'
-        ? Number(logIndexRaw)
-        : undefined
+    const logIndex =
+      typeof logIndexRaw === 'number'
+        ? logIndexRaw
+        : typeof logIndexRaw === 'string'
+          ? Number(logIndexRaw)
+          : undefined
 
     const simulationResultsRaw =
       candidate.simulationResults ??
@@ -255,17 +280,20 @@ function normalizeNotification(data: unknown): ReactivityNotification | null {
       ? (simulationResultsRaw as Hex[])
       : undefined
 
- if (topics && payload) {
-  return {
-    topics,
-    data: payload,
-    address: (address ?? '0x') as Hex,
-    ...(transactionHash ? { transactionHash } : {}),
-    ...(blockNumber != null ? { blockNumber } : {}),
-    logIndex,
-    simulationResults,
-  }
-}
+    // address is optional — the Somnia Reactivity SDK payload does not include it.
+    // '0x' is a safe placeholder; the real address is filled in by processBlockNumber
+    // via getLogs when the signal is matched to a log entry.
+    if (topics && payload) {
+      return {
+        topics,
+        data: payload,
+        address: (address ?? '0x') as Hex,
+        ...(transactionHash ? { transactionHash } : {}),
+        ...(blockNumber != null ? { blockNumber } : {}),
+        logIndex,
+        simulationResults,
+      }
+    }
   }
 
   if (!hasLoggedMalformedPayload) {
@@ -279,6 +307,8 @@ function normalizeNotification(data: unknown): ReactivityNotification | null {
 }
 
 async function main() {
+
+  startKeepAliveServer()  
   console.log('CHAINBOOK Listener starting...')
 
   const subscriptions: Array<{ unsubscribe?: () => Promise<unknown> | unknown }> = []
@@ -288,10 +318,8 @@ async function main() {
     log_fallback: 0,
   }
 
-  const showcaseTopic = (env.REACTIVITY_SHOWCASE_TOPIC0 ??
-    keccak256(toHex('ReactivityProof(address,bytes32,bytes32,uint256)'))) as Hex
-
-
+  // Used only by getLogs in processBlockNumber (HTTP fallback cost control).
+  // The reactivity WS subscriptions use no topicOverrides — true wildcard.
   const TOPIC_FILTERS: Hex[] = [
     ERC20_TRANSFER_TOPIC,
     ERC20_APPROVAL_TOPIC,
@@ -303,17 +331,14 @@ async function main() {
     LIQUIDITY_REMOVE_TOPIC,
     DAO_VOTE_TOPIC,
     WHALE_DETECTED_TOPIC as Hex,
-    ...(env.REACTIVITY_SHOWCASE_HANDLER_ADDRESS ? [showcaseTopic] : []),
   ]
-  const TOPIC_FILTERS_SET = new Set(TOPIC_FILTERS.map((topic) => topic.toLowerCase()))
+
   const spotlightSources = sanitizeAddressList(env.REACTIVITY_SPOTLIGHT_SOURCES)
   const spotlightTopicsFromEnv = sanitizeTopicList(env.REACTIVITY_SPOTLIGHT_TOPICS)
 
   if (env.LISTENER_USE_WS) {
     console.log('[Main] Reactivity WS enabled')
-    console.log(
-      `[Main] Reactivity WS URL: ${env.SOMNIA_REACTIVITY_WS ?? env.SOMNIA_RPC_WS}`,
-    )
+    console.log(`[Main] Reactivity WS URL: ${env.SOMNIA_REACTIVITY_WS ?? env.SOMNIA_RPC_WS}`)
     console.log(`[Main] Spotlight enabled: ${env.REACTIVITY_SPOTLIGHT_ENABLED ? 'yes' : 'no'}`)
     console.log(`[Main] Spotlight sources loaded: ${spotlightSources.length}`)
     if (env.REACTIVITY_SPOTLIGHT_SOURCES.length !== spotlightSources.length) {
@@ -325,11 +350,6 @@ async function main() {
       console.log(`[Main] Spotlight sources: ${spotlightSources.join(',')}`)
     }
     console.log(`[Main] Spotlight topics loaded: ${spotlightTopicsFromEnv.length}`)
-    if (env.REACTIVITY_SPOTLIGHT_TOPICS.length !== spotlightTopicsFromEnv.length) {
-      console.warn(
-        `[Main] Ignoring ${env.REACTIVITY_SPOTLIGHT_TOPICS.length - spotlightTopicsFromEnv.length} invalid spotlight topic(s).`,
-      )
-    }
     if (spotlightTopicsFromEnv.length > 0) {
       console.log(`[Main] Spotlight topics: ${spotlightTopicsFromEnv.join(',')}`)
     } else {
@@ -339,12 +359,11 @@ async function main() {
       `[Main] Showcase handler configured: ${env.REACTIVITY_SHOWCASE_HANDLER_ADDRESS ? 'yes' : 'no'}`,
     )
     console.log(`[Main] Reactivity signal match wait ms: ${env.REACTIVITY_SIGNAL_MATCH_WAIT_MS}`)
+    console.log(`[Main] Block dedup TTL ms: ${BLOCK_DEDUP_TTL_MS}`)
   }
 
   if (env.LISTENER_USE_WS) {
-    const primarySdk = new SDK({
-      public: publicClientReactivityWs,
-    })
+    const primarySdk = new SDK({ public: publicClientReactivityWs })
     const fallbackSdk =
       env.SOMNIA_REACTIVITY_WS && env.SOMNIA_REACTIVITY_WS !== env.SOMNIA_RPC_WS
         ? new SDK({ public: publicClientWs })
@@ -368,6 +387,7 @@ async function main() {
         '[Main] Spotlight has no ethCalls configured; disabling onlyPushChanges to avoid dropped notifications.',
       )
     }
+
     const baseParams: Record<string, unknown> = {
       ethCalls: configuredEthCalls,
       onError: (error: Error) => {
@@ -378,135 +398,146 @@ async function main() {
       baseParams.context = env.REACTIVITY_CONTEXT
     }
 
-console.log('Subscribing to Somnia Reactivity (wildcard)...')
-const wildcardParams = {
-  ...baseParams,
-  // No topicOverrides — wildcard catches everything, we filter client-side
-  onlyPushChanges: false,
-  onData: (data: unknown) => {
-    if (!hasLoggedWildcardPayload && data && typeof data === 'object') {
-      hasLoggedWildcardPayload = true
-      console.log(
-        '[Main] Wildcard Reactivity payload keys:',
-        Object.keys(data as Record<string, unknown>),
-      )
-    }
-    const payload = normalizeNotification(data)
-    if (!payload) return
-
-    // Client-side topic filter — only record signals for events we care about
-    const topic0 = payload.topics[0]?.toLowerCase()
-    if (!topic0 || !TOPIC_FILTERS_SET.has(topic0)) return
-
-    recordReactivitySignal(payload, 'reactivity_wildcard')
-    const txHash = payload.transactionHash
-    const blockNumber = payload.blockNumber
-    if (!txHash || blockNumber == null) return
-    Promise.resolve().then(async () => {
-      try {
-        await processEvent({
-          topics: payload.topics,
-          data: payload.data,
-          address: payload.address,
-          transactionHash: txHash,
-          blockNumber,
-          logIndex: payload.logIndex,
-        }, {
-          source: 'reactivity_wildcard',
-          simulationResults: payload.simulationResults,
-        })
-      } catch (err) {
-        console.error('[Main] Unhandled error in processEvent:', err)
-      }
-    })
-  },
-} as unknown as SubscriptionInitParams
-
-const wildcardSubscription = await subscribeWithFallback(wildcardParams, 'Wildcard')
-let wildcardCreated = 0
-if (wildcardSubscription) {
-  wildcardCreated = 1
-  subscriptions.push(wildcardSubscription)
-}
-if (wildcardCreated === 0) {
-  console.warn('[Main] Reactivity wildcard subscription unavailable; relying on fallback logs.')
-} else {
-  console.log('Reactivity subscription active (1 wildcard)')
-}
-
-if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
-  console.log('Subscribing to Reactivity Spotlight (wildcard)...')
-  const spotlightParamsRaw: Record<string, unknown> = {
-    ...baseParams,
-    // No topicOverrides — filter client-side
-    onlyPushChanges: spotlightOnlyPushChanges,
-    onData: (data: unknown) => {
-      if (!hasLoggedSpotlightPayload && data && typeof data === 'object') {
-        hasLoggedSpotlightPayload = true
-        console.log(
-          '[Main] Spotlight Reactivity payload keys:',
-          Object.keys(data as Record<string, unknown>),
-        )
-      }
-      const payload = normalizeNotification(data)
-      if (!payload) return
-
-      // Client-side topic filter
-      const topic0 = payload.topics[0]?.toLowerCase()
-      if (!topic0 || !TOPIC_FILTERS_SET.has(topic0)) return
-
-      recordReactivitySignal(payload, 'reactivity_spotlight')
-      const txHash = payload.transactionHash
-      const blockNumber = payload.blockNumber
-      if (!txHash || blockNumber == null) return
-      Promise.resolve().then(async () => {
-        try {
-          await processEvent({
-            topics: payload.topics,
-            data: payload.data,
-            address: payload.address,
-            transactionHash: txHash,
-            blockNumber,
-            logIndex: payload.logIndex,
-          }, {
-            source: 'reactivity_spotlight',
-            simulationResults: payload.simulationResults,
-          })
-        } catch (err) {
-          console.error('[Main] Unhandled error in spotlight processEvent:', err)
+    // ── Wildcard subscription ────────────────────────────────────────────────
+    // No topicOverrides — receives every on-chain event. All signals are stored
+    // and matched in processBlockNumber. This is future-proof: adding new event
+    // types to classifyEventTopic automatically starts working without any
+    // subscription code change.
+    console.log('Subscribing to Somnia Reactivity (wildcard)...')
+    const wildcardParams = {
+      ...baseParams,
+      onlyPushChanges: false,
+      onData: (data: unknown) => {
+        if (!hasLoggedWildcardPayload && data && typeof data === 'object') {
+          hasLoggedWildcardPayload = true
+          console.log(
+            '[Main] Wildcard Reactivity payload keys:',
+            Object.keys(data as Record<string, unknown>),
+          )
         }
-      })
-    },
-  }
-  if (spotlightSources.length > 0) {
-    spotlightParamsRaw.eventContractSources = spotlightSources
-  }
+        const payload = normalizeNotification(data)
+        if (!payload) return
 
-  const spotlightSubscription = await subscribeWithFallback(
-    spotlightParamsRaw as SubscriptionInitParams,
-    'Spotlight',
-  )
-  if (!spotlightSubscription) {
-    console.warn('[Main] Spotlight subscription disabled')
-  } else {
-    subscriptions.push(spotlightSubscription)
-    console.log('Reactivity spotlight subscription active (1 wildcard)')
-  }
-}
+        recordReactivitySignal(payload, 'reactivity_wildcard')
+
+        const txHash = payload.transactionHash
+        const blockNumber = payload.blockNumber
+        if (!txHash || blockNumber == null) return
+
+        Promise.resolve().then(async () => {
+          try {
+            await processEvent(
+              {
+                topics: payload.topics,
+                data: payload.data,
+                address: payload.address,
+                transactionHash: txHash,
+                blockNumber,
+                logIndex: payload.logIndex,
+              },
+              {
+                source: 'reactivity_wildcard',
+                simulationResults: payload.simulationResults,
+              },
+            )
+          } catch (err) {
+            console.error('[Main] Unhandled error in processEvent:', err)
+          }
+        })
+      },
+    } as unknown as SubscriptionInitParams
+
+    const wildcardSubscription = await subscribeWithFallback(wildcardParams, 'Wildcard')
+    let wildcardCreated = 0
+    if (wildcardSubscription) {
+      wildcardCreated = 1
+      subscriptions.push(wildcardSubscription)
+    }
+    if (wildcardCreated === 0) {
+      console.warn('[Main] Reactivity wildcard subscription unavailable; relying on fallback logs.')
+    } else {
+      console.log('Reactivity subscription active (1 wildcard)')
+    }
+
+    // ── Spotlight subscription ───────────────────────────────────────────────
+    if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
+      console.log('Subscribing to Reactivity Spotlight (wildcard)...')
+      const spotlightParamsRaw: Record<string, unknown> = {
+        ...baseParams,
+        onlyPushChanges: spotlightOnlyPushChanges,
+        onData: (data: unknown) => {
+          if (!hasLoggedSpotlightPayload && data && typeof data === 'object') {
+            hasLoggedSpotlightPayload = true
+            console.log(
+              '[Main] Spotlight Reactivity payload keys:',
+              Object.keys(data as Record<string, unknown>),
+            )
+          }
+          const payload = normalizeNotification(data)
+          if (!payload) return
+
+          recordReactivitySignal(payload, 'reactivity_spotlight')
+
+          const txHash = payload.transactionHash
+          const blockNumber = payload.blockNumber
+          if (!txHash || blockNumber == null) return
+
+          Promise.resolve().then(async () => {
+            try {
+              await processEvent(
+                {
+                  topics: payload.topics,
+                  data: payload.data,
+                  address: payload.address,
+                  transactionHash: txHash,
+                  blockNumber,
+                  logIndex: payload.logIndex,
+                },
+                {
+                  source: 'reactivity_spotlight',
+                  simulationResults: payload.simulationResults,
+                },
+              )
+            } catch (err) {
+              console.error('[Main] Unhandled error in spotlight processEvent:', err)
+            }
+          })
+        },
+      }
+      if (spotlightSources.length > 0) {
+        spotlightParamsRaw.eventContractSources = spotlightSources
+      }
+
+      const spotlightSubscription = await subscribeWithFallback(
+        spotlightParamsRaw as SubscriptionInitParams,
+        'Spotlight',
+      )
+      if (!spotlightSubscription) {
+        console.warn('[Main] Spotlight subscription disabled')
+      } else {
+        subscriptions.push(spotlightSubscription)
+        console.log('Reactivity spotlight subscription active (1 wildcard)')
+      }
+    }
   } else {
     console.log('LISTENER_USE_WS=false - skipping Reactivity subscription')
-    console.warn('[Main] Reactivity WebSocket subscription is disabled; ingestion will rely on fallback logs only.')
+    console.warn(
+      '[Main] Reactivity WebSocket subscription is disabled; ingestion will rely on fallback logs only.',
+    )
   }
 
   async function processBlockNumber(
     blockNumber: bigint,
     options?: { preferReactivitySignals?: boolean },
   ) {
+    // Block deduplication — prevents watchBlocks and poll from double-processing
+    if (isBlockAlreadyProcessed(blockNumber)) return
+    markBlockProcessed(blockNumber)
+
     if (options?.preferReactivitySignals && env.REACTIVITY_SIGNAL_MATCH_WAIT_MS > 0) {
       await sleep(env.REACTIVITY_SIGNAL_MATCH_WAIT_MS)
     }
 
-    // Fetch logs for matching topics in this block
     const logs = await publicClientHttp.getLogs({
       fromBlock: blockNumber,
       toBlock: blockNumber,
@@ -515,23 +546,26 @@ if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
 
     for (const log of logs) {
       try {
-      const signal = consumeReactivitySignal({
-        topics: log.topics as `0x${string}`[],
-           data: log.data as `0x${string}`,
-})
-        const resolvedSource = signal?.source ?? 'log_fallback'
-        ingestionSourceCounters[resolvedSource] += 1
-        await processEvent({
+        const signal = consumeReactivitySignal({
           topics: log.topics as `0x${string}`[],
           data: log.data as `0x${string}`,
-          address: log.address as `0x${string}`,
-          transactionHash: log.transactionHash as `0x${string}`,
-          blockNumber: log.blockNumber as bigint,
-          logIndex: log.logIndex,
-        }, {
-          source: resolvedSource,
-          simulationResults: signal?.simulationResults,
         })
+        const resolvedSource = signal?.source ?? 'log_fallback'
+        ingestionSourceCounters[resolvedSource] += 1
+        await processEvent(
+          {
+            topics: log.topics as `0x${string}`[],
+            data: log.data as `0x${string}`,
+            address: log.address as `0x${string}`,
+            transactionHash: log.transactionHash as `0x${string}`,
+            blockNumber: log.blockNumber as bigint,
+            logIndex: log.logIndex,
+          },
+          {
+            source: resolvedSource,
+            simulationResults: signal?.simulationResults,
+          },
+        )
       } catch (err) {
         console.error('[Logs] Unhandled error in processEvent:', err)
       }
@@ -563,8 +597,6 @@ if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
     }
   }
 
-  // Fallback: use block stream + getLogs per block for ERC20 Transfer (and other topics)
-  // Also handles native STT transfers by scanning transactions.
   const blockClient = env.LISTENER_USE_WS ? publicClientWs : publicClientHttp
   const unwatchBlocks = blockClient.watchBlocks({
     onBlock: async (block) => {
@@ -582,20 +614,22 @@ if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
     },
   })
 
-  // Bootstrap recent blocks to populate feed quickly
+  // Bootstrap recent blocks
   try {
     const latest = await publicClientHttp.getBlockNumber()
     const count = env.LISTENER_BOOTSTRAP_BLOCKS
     const start = count > 0 ? latest - BigInt(count - 1) : latest
     const from = start < 0n ? 0n : start
+    console.log(`[Bootstrap] Processing blocks ${from}–${latest} (${count} blocks)...`)
     for (let b = from; b <= latest; b++) {
       await processBlockNumber(b)
     }
+    console.log('[Bootstrap] Complete.')
   } catch (err) {
     console.error('[Bootstrap] Failed to process recent blocks:', err)
   }
 
-  // Poll for new blocks as a fallback if WS streams drop events
+  // Poll fallback — block dedup ensures no double-processing with watchBlocks
   let lastProcessedBlock: bigint | null = null
   const pollId = setInterval(async () => {
     try {
@@ -621,39 +655,27 @@ if (env.REACTIVITY_SPOTLIGHT_ENABLED) {
     if (total === 0) return
     console.log(
       `[Metrics] source mix | reactivity_wildcard=${ingestionSourceCounters.reactivity_wildcard} ` +
-      `reactivity_spotlight=${ingestionSourceCounters.reactivity_spotlight} ` +
-      `log_fallback=${ingestionSourceCounters.log_fallback}`,
+        `reactivity_spotlight=${ingestionSourceCounters.reactivity_spotlight} ` +
+        `log_fallback=${ingestionSourceCounters.log_fallback}`,
     )
   }, 60_000)
 
-  // Background intervals
   startTrendingFlushInterval()
   startReputationFlushInterval()
 
-  // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`\n[Main] Received ${signal}. Shutting down gracefully...`)
     try {
-      await Promise.allSettled(
-        subscriptions.map((subscription) => subscription.unsubscribe?.()),
-      )
+      await Promise.allSettled(subscriptions.map((s) => s.unsubscribe?.()))
     } catch {}
-    try {
-      unwatchBlocks?.()
-    } catch {}
-    try {
-      clearInterval(pollId)
-    } catch {}
-    try {
-      clearInterval(metricsId)
-    } catch {}
+    try { unwatchBlocks?.() } catch {}
+    try { clearInterval(pollId) } catch {}
+    try { clearInterval(metricsId) } catch {}
     process.exit(0)
   }
 
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGTERM', () => shutdown('SIGTERM'))
-
-  // Keep process alive
   process.on('uncaughtException', (err) => {
     console.error('[Main] Uncaught exception:', err)
   })

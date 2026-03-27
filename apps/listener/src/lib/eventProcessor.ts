@@ -14,16 +14,16 @@ import { publicClientHttp } from '../config/chain.js'
 import { getTokenMetadata } from './tokenMetadata.js'
 import { updateWalletTokenHolding, updateWalletNativeBalanceUsd, upsertMintedToken } from './walletTokens.js'
 
-// Queue for batching reputation updates - flushed every 5 minutes
+// ─── Reputation queue ─────────────────────────────────────────────────────────
 const reputationQueue = new Map<string, { volumeUsd: number; activityCount: number }>()
 
-// ===== Concurrency Limiting =====
+// ─── Concurrency limiters ─────────────────────────────────────────────────────
 let rpcConcurrent = 0
 let dbConcurrent = 0
 
 async function withRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
   while (rpcConcurrent >= env.MAX_CONCURRENT_RPC_CALLS) {
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 10))
   }
   rpcConcurrent++
   try {
@@ -35,7 +35,7 @@ async function withRpcLimit<T>(fn: () => Promise<T>): Promise<T> {
 
 async function withDbLimit<T>(fn: () => Promise<T>): Promise<T> {
   while (dbConcurrent >= env.MAX_CONCURRENT_DB_OPERATIONS) {
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 10))
   }
   dbConcurrent++
   try {
@@ -45,6 +45,52 @@ async function withDbLimit<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ─── Post source cache ────────────────────────────────────────────────────────
+// Eliminates the pre-upsert DB SELECT (getExistingPostSource) for events that
+// have already been seen within the TTL window. On a typical block the same
+// postIdHash is processed by both the reactivity path and the log fallback path
+// within seconds — the second call hits the cache and avoids the DB entirely.
+const POST_SOURCE_CACHE_TTL_MS = env.POST_SOURCE_CACHE_TTL_MS ?? 120_000
+const postSourceCache = new Map<string, { source: string; cachedAt: number }>()
+let lastPostSourceCacheCleanup = 0
+
+function getCachedPostSource(postIdHash: string): string | null {
+  const entry = postSourceCache.get(postIdHash)
+  if (!entry) return null
+  if (Date.now() - entry.cachedAt > POST_SOURCE_CACHE_TTL_MS) {
+    postSourceCache.delete(postIdHash)
+    return null
+  }
+  return entry.source
+}
+
+function setCachedPostSource(postIdHash: string, source: string): void {
+  postSourceCache.set(postIdHash, { source, cachedAt: Date.now() })
+  const now = Date.now()
+  if (now - lastPostSourceCacheCleanup > 60_000) {
+    lastPostSourceCacheCleanup = now
+    const cutoff = now - POST_SOURCE_CACHE_TTL_MS
+    for (const [k, v] of postSourceCache.entries()) {
+      if (v.cachedAt < cutoff) postSourceCache.delete(k)
+    }
+  }
+}
+
+// ─── txFromCache (capped) ─────────────────────────────────────────────────────
+// Caches tx.from keyed by txHash. One getTransaction RPC call per unique tx.
+// Capped at 2000 entries to bound memory on Railway's constrained instances.
+const TX_FROM_CACHE_MAX = 2_000
+const txFromCache = new Map<string, string>()
+
+function setTxFromCache(txHash: string, from: string): void {
+  if (txFromCache.size >= TX_FROM_CACHE_MAX) {
+    const firstKey = txFromCache.keys().next().value
+    if (firstKey !== undefined) txFromCache.delete(firstKey)
+  }
+  txFromCache.set(txHash, from)
+}
+
+// ─── ERC-20 balanceOf ABI ─────────────────────────────────────────────────────
 const ERC20_BALANCE_OF_ABI = [
   {
     name: 'balanceOf',
@@ -71,22 +117,18 @@ export function queueReputationUpdate(wallet: string, volumeUsd: number): void {
 
 export async function flushReputationQueue(): Promise<void> {
   if (reputationQueue.size === 0) return
-
   const updates = Array.from(reputationQueue.entries())
   reputationQueue.clear()
-
   for (const [wallet, data] of updates) {
     const { error } = await supabase.rpc('update_wallet_reputation', {
       p_address: wallet.toLowerCase(),
       p_volume_delta: data.volumeUsd,
       p_activity_delta: data.activityCount,
     })
-
     if (error) {
       console.error(`[ReputationQueue] RPC error for ${wallet}:`, error.message)
     }
   }
-
   console.log(`[ReputationQueue] Flushed ${updates.length} wallet reputation updates`)
 }
 
@@ -95,7 +137,7 @@ export function startReputationFlushInterval(): void {
   console.log(`[ReputationQueue] Flush interval started (${env.REPUTATION_UPDATE_INTERVAL_MS}ms)`)
 }
 
-// ---------------- Main event handler ----------------
+// ─── Main event handler ───────────────────────────────────────────────────────
 
 interface ReactivityData {
   topics: Hex[]
@@ -111,19 +153,19 @@ interface ProcessEventOptions {
   simulationResults?: Hex[]
 }
 
-export async function processEvent(raw: ReactivityData, options?: ProcessEventOptions): Promise<void> {
+export async function processEvent(
+  raw: ReactivityData,
+  options?: ProcessEventOptions,
+): Promise<void> {
   if (!raw?.topics || raw.topics.length === 0) return
   const topic0 = raw.topics[0]
   if (!topic0) return
 
-  // Track proof events from the on-chain showcase handler even if they are not mapped to post types.
   await maybeRecordShowcaseEvent(raw)
 
-  // Extract the topic-specific `from` address for mint / transfer classification.
   const from = extractFromAddressForTopic(topic0, raw.topics)
-
   let postType = classifyEventTopic(topic0, from)
-  if (!postType) return // unrecognised event - skip
+  if (!postType) return
 
   const decoded = decodeEvent(topic0, raw.topics, raw.data, raw.address)
   if (!decoded) return
@@ -131,17 +173,15 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
   const tokenMeta =
     (await getTokenMetadata(decoded.tokenIn)) ??
     (await getTokenMetadata(decoded.contractAddress))
-
   const tokenOutMeta = await getTokenMetadata(decoded.tokenOut)
 
-  // Reclassify ERC721 transfers as NFT trades
   if (postType === 'TRANSFER' && tokenMeta?.is_nft) {
     postType = 'NFT_TRADE'
   }
 
-  // Price policy:
-  // - Native STT transfer pricing is handled in processNativeTransfer.
-  // - For ERC20-like events, only map USD when token symbol is STT (via SOMI adapter).
+  // ── USD pricing ──────────────────────────────────────────────────────────────
+  // Only price when the token symbol matches the native token (STT).
+  // All other ERC20 tokens have no reliable oracle and stay at $0.
   let amountUsd = 0
   const tokenSymbolUpper = tokenMeta?.symbol?.toUpperCase()
   if (
@@ -152,23 +192,44 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
     const decimals = tokenMeta?.decimals ?? 18
     amountUsd = await toUsd(decoded.amountRaw, 'somnia-network', decimals)
   }
-  const isWhaleAlert =
-    decoded.isWhaleEvent === true || amountUsd >= env.WHALE_THRESHOLD_USD
+
+  // ── Unpriced ERC20 transfer minimum amount filter ────────────────────────────
+  // Since we have no USD price for most ERC20 tokens, we use a raw token
+  // minimum to filter out dust and spam transfers.
+  //
+  // Rule: only applies to TRANSFER posts with amountUsd = 0 (unpriced tokens).
+  //       MINT, SWAP, NFT_TRADE, LIQUIDITY_*, DAO_VOTE, CONTRACT_DEPLOY are
+  //       never filtered here — they all pass through unconditionally.
+  //
+  // STT-priced transfers bypass this because amountUsd > 0 for them and they
+  // use the USD significance path instead.
+  if (postType === 'TRANSFER' && amountUsd === 0 && decoded.amountRaw != null) {
+    const decimals = BigInt(tokenMeta?.decimals ?? 18)
+    const minRaw = BigInt(env.ERC20_TRANSFER_MIN_AMOUNT) * (10n ** decimals)
+    if (decoded.amountRaw < minRaw) return
+  }
+
+  const isWhaleAlert = decoded.isWhaleEvent === true || amountUsd >= env.WHALE_THRESHOLD_USD
   const significanceScore = calculateSignificanceScore(amountUsd, postType, isWhaleAlert)
+
+  // ── Significance ─────────────────────────────────────────────────────────────
+  // An unpriced ERC20 transfer that reached this point has already passed the
+  // minimum amount filter above, so it qualifies as significant regardless of
+  // its USD value (which is $0). Without this clause every unpriced ERC20
+  // transfer would be is_significant=false and invisible in the frontend.
+  const isUnpricedTransferAboveMin =
+    postType === 'TRANSFER' &&
+    amountUsd === 0 &&
+    decoded.amountRaw != null
+
   const isSignificant =
     postType !== 'TRANSFER' ||
     amountUsd >= env.SIGNIFICANT_MIN_USD ||
-    significanceScore >= env.SIGNIFICANT_MIN_SCORE
+    significanceScore >= env.SIGNIFICANT_MIN_SCORE ||
+    isUnpricedTransferAboveMin
 
-  // Generate deterministic post hash from tx + log index
-  const postIdHash = keccak256(
-    toHex(`${raw.transactionHash}-${raw.logIndex ?? 0}`),
-  )
-
-  // Use tx.from as the canonical wallet address if enabled
+  const postIdHash = keccak256(toHex(`${raw.transactionHash}-${raw.logIndex ?? 0}`))
   const resolvedWallet = await resolveWalletAddress(decoded.wallet, raw.transactionHash)
-
-  // Ensure wallet row exists before foreign key reference
   await ensureWallet(resolvedWallet)
 
   const post = {
@@ -217,29 +278,34 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
       simulationResults: options?.simulationResults,
     })
     if (balanceMeta) {
-      post.metadata = {
-        ...post.metadata,
-        ...balanceMeta,
-      }
+      post.metadata = { ...post.metadata, ...balanceMeta }
     }
   }
 
-  const existingSource = await getExistingPostSource(postIdHash)
+  // ── Source priority check ──────────────────────────────────────────────────
+  // 1. Spotlight is always priority 4 (max) — skip the check entirely to save
+  //    one DB read per spotlight event.
+  // 2. For all other sources, check the in-memory cache first (free). Only fall
+  //    back to the DB on a true cache miss (first time we see this postIdHash).
   const incomingSource = options?.source ?? 'unknown'
-  const shouldSkipWrite =
-    existingSource != null &&
-    sourcePriority(incomingSource) < sourcePriority(existingSource)
+  const incomingPriority = sourcePriority(incomingSource)
 
-  if (shouldSkipWrite) {
-    return
+  if (incomingSource !== 'reactivity_spotlight') {
+    const cachedSource = getCachedPostSource(postIdHash)
+    const existingSource = cachedSource ?? (await getExistingPostSource(postIdHash))
+    if (existingSource != null && incomingPriority < sourcePriority(existingSource)) {
+      return
+    }
   }
 
   const { data: insertedPost, error } = await upsertPostWithRetry(post)
-
   if (error) {
     console.error('[EventProcessor] Post upsert error:', error.message)
     return
   }
+
+  // Populate cache so subsequent duplicate calls skip the DB read
+  setCachedPostSource(postIdHash, incomingSource)
 
   if (options?.source === 'reactivity_spotlight' && insertedPost?.id) {
     const { error: spotlightError } = await supabase
@@ -258,49 +324,52 @@ export async function processEvent(raw: ReactivityData, options?: ProcessEventOp
     `[EventProcessor][${incomingSource}] ${isWhaleAlert ? 'WHALE ' : ''}${postType} | $${amountUsd.toFixed(2)} | ${resolvedWallet.slice(0, 8)}...`,
   )
 
-  // Async side-effects - do not await to keep event processing fast
   void incrementTrending(decoded.contractAddress, resolvedWallet)
   void queueReputationUpdate(resolvedWallet, amountUsd)
 
-  // Wallet token tracking - DISABLED by default to save 30% RPC usage
-  // Capture tokenIn into a const so TypeScript narrows it to `string` inside the closures
-  const tokenIn = decoded.tokenIn
-  if (env.ENABLE_WALLET_TOKEN_TRACKING && tokenIn) {
-    const fromAddr = typeof decoded.metadata?.from === 'string'
-      ? decoded.metadata.from
-      : resolvedWallet
-    const toAddr = typeof decoded.metadata?.to === 'string'
-      ? decoded.metadata.to
-      : undefined
-
+  if (env.ENABLE_WALLET_TOKEN_TRACKING && decoded.tokenIn) {
+    const fromAddr =
+      typeof decoded.metadata?.from === 'string' ? decoded.metadata.from : resolvedWallet
+    const toAddr =
+      typeof decoded.metadata?.to === 'string' ? decoded.metadata.to : undefined
     if (fromAddr && !isZeroAddress(fromAddr)) {
-      void withRpcLimit(() => updateWalletTokenHolding(fromAddr, tokenIn, tokenMeta?.decimals ?? null))
+      void withRpcLimit(() =>
+        updateWalletTokenHolding(fromAddr, decoded.tokenIn!, tokenMeta?.decimals ?? null),
+      )
     }
     if (toAddr && !isZeroAddress(toAddr)) {
-      void withRpcLimit(() => updateWalletTokenHolding(toAddr, tokenIn, tokenMeta?.decimals ?? null))
+      void withRpcLimit(() =>
+        updateWalletTokenHolding(toAddr, decoded.tokenIn!, tokenMeta?.decimals ?? null),
+      )
     }
   }
 
-  if (postType === 'MINT' && tokenIn) {
+  if (postType === 'MINT' && decoded.tokenIn) {
     const mintedOwner = (decoded.metadata?.to as string | undefined) ?? resolvedWallet
     if (mintedOwner && !isZeroAddress(mintedOwner)) {
-      void upsertMintedToken(mintedOwner, tokenIn, 'MINTED', raw.transactionHash)
+      void upsertMintedToken(mintedOwner, decoded.tokenIn, 'MINTED', raw.transactionHash)
     }
   }
 
-  // Notifications - DISABLED by default to save 25% DB usage
-  // Only dispatch for significant events above minimum USD threshold
-  if (insertedPost?.id && env.ENABLE_NOTIFICATIONS && amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD) {
-    void withDbLimit(() => dispatchNotifications({
-      postId: insertedPost.id,
-      walletAddress: resolvedWallet,
-      contractAddress: decoded.contractAddress,
-      amountUsd,
-      isWhaleAlert,
-      postType,
-    }))
+  if (
+    insertedPost?.id &&
+    env.ENABLE_NOTIFICATIONS &&
+    amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD
+  ) {
+    void withDbLimit(() =>
+      dispatchNotifications({
+        postId: insertedPost.id,
+        walletAddress: resolvedWallet,
+        contractAddress: decoded.contractAddress,
+        amountUsd,
+        isWhaleAlert,
+        postType,
+      }),
+    )
   }
 }
+
+// ─── Native transfer ──────────────────────────────────────────────────────────
 
 interface NativeTransfer {
   hash: Hex
@@ -314,10 +383,6 @@ export async function processNativeTransfer(tx: NativeTransfer): Promise<void> {
   if (!tx.to) return
   if (!tx.value || tx.value === 0n) return
 
-  // Capture tx.to into a const so TypeScript keeps the narrowed non-nullable type
-  // in all closures below (the `if (!tx.to) return` above already guards it).
-  const txTo: Hex = tx.to
-
   const amountUsd = await toUsd(tx.value, 'somnia-network', 18)
   const isWhaleAlert = amountUsd >= env.WHALE_THRESHOLD_USD
   const significanceScore = calculateSignificanceScore(amountUsd, 'TRANSFER', isWhaleAlert)
@@ -325,7 +390,6 @@ export async function processNativeTransfer(tx: NativeTransfer): Promise<void> {
     amountUsd >= env.SIGNIFICANT_MIN_USD || significanceScore >= env.SIGNIFICANT_MIN_SCORE
 
   const postIdHash = keccak256(toHex(`${tx.hash}-0`))
-
   await ensureWallet(tx.from)
 
   const post = {
@@ -342,7 +406,7 @@ export async function processNativeTransfer(tx: NativeTransfer): Promise<void> {
     tx_hash: tx.hash,
     block_number: Number(tx.blockNumber ?? 0n),
     metadata: {
-      to: txTo.toLowerCase(),
+      to: tx.to.toLowerCase(),
       is_native: true,
       token_symbol: env.NATIVE_TOKEN_SYMBOL,
       token_name: env.NATIVE_TOKEN_NAME,
@@ -356,35 +420,42 @@ export async function processNativeTransfer(tx: NativeTransfer): Promise<void> {
   }
 
   const { data: insertedPost, error } = await upsertPostWithRetry(post)
-
   if (error) {
     console.error('[NativeTransfer] Post upsert error:', error.message)
     return
   }
 
-  console.log(`[NativeTransfer] ${isWhaleAlert ? 'WHALE ' : ''}TRANSFER | $${amountUsd.toFixed(2)} | ${tx.from.slice(0, 8)}...`)
+  console.log(
+    `[NativeTransfer] ${isWhaleAlert ? 'WHALE ' : ''}TRANSFER | $${amountUsd.toFixed(2)} | ${tx.from.slice(0, 8)}...`,
+  )
 
-  void incrementTrending(txTo, tx.from)
+  void incrementTrending(tx.to, tx.from)
   void queueReputationUpdate(tx.from, amountUsd)
 
-  // Wallet native balance tracking - DISABLED by default to save RPC usage
   if (env.ENABLE_WALLET_TOKEN_TRACKING) {
     void withRpcLimit(() => updateWalletNativeBalanceUsd(tx.from))
-    void withRpcLimit(() => updateWalletNativeBalanceUsd(txTo))
+    if (tx.to) void withRpcLimit(() => updateWalletNativeBalanceUsd(tx.to!))
   }
 
-  // Notifications - DISABLED by default to save DB usage
-  if (insertedPost?.id && env.ENABLE_NOTIFICATIONS && amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD) {
-    void withDbLimit(() => dispatchNotifications({
-      postId: insertedPost.id,
-      walletAddress: tx.from,
-      contractAddress: txTo,
-      amountUsd,
-      isWhaleAlert,
-      postType: 'TRANSFER',
-    }))
+  if (
+    insertedPost?.id &&
+    env.ENABLE_NOTIFICATIONS &&
+    amountUsd >= env.NOTIFICATION_MIN_USD_THRESHOLD
+  ) {
+    void withDbLimit(() =>
+      dispatchNotifications({
+        postId: insertedPost.id,
+        walletAddress: tx.from,
+        contractAddress: tx.to!,
+        amountUsd,
+        isWhaleAlert,
+        postType: 'TRANSFER',
+      }),
+    )
   }
 }
+
+// ─── Contract deploy ──────────────────────────────────────────────────────────
 
 interface ContractDeploy {
   hash: Hex
@@ -399,7 +470,6 @@ export async function processContractDeploy(tx: ContractDeploy): Promise<void> {
   if (!deployedAddress) return
 
   await ensureWallet(tx.from)
-
   const deployedMeta = await getTokenMetadata(deployedAddress)
 
   const post = {
@@ -428,7 +498,6 @@ export async function processContractDeploy(tx: ContractDeploy): Promise<void> {
   }
 
   const { data: insertedPost, error } = await upsertPostWithRetry(post)
-
   if (error) {
     console.error('[ContractDeploy] Post upsert error:', error.message)
     return
@@ -454,6 +523,8 @@ export async function processContractDeploy(tx: ContractDeploy): Promise<void> {
   }
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function calculateSignificanceScore(
   amountUsd: number,
   postType: PostType,
@@ -471,23 +542,17 @@ function calculateSignificanceScore(
     NFT_TRADE: 7,
   }
   const whaleBonus = isWhaleAlert ? 20 : 0
-  const score = base + (typeBonus[postType] ?? 0) + whaleBonus
-  return Number(score.toFixed(2))
+  return Number((base + (typeBonus[postType] ?? 0) + whaleBonus).toFixed(2))
 }
 
-const txFromCache = new Map<string, string>()
-
-async function resolveWalletAddress(
-  decodedWallet: string,
-  txHash: Hex,
-): Promise<string> {
+async function resolveWalletAddress(decodedWallet: string, txHash: Hex): Promise<string> {
   if (!env.USE_TX_FROM_AS_WALLET) return decodedWallet
   const cached = txFromCache.get(txHash)
   if (cached) return cached
   try {
     const tx = await publicClientHttp.getTransaction({ hash: txHash })
     if (tx?.from) {
-      txFromCache.set(txHash, tx.from)
+      setTxFromCache(txHash, tx.from)
       return tx.from
     }
   } catch {
@@ -566,10 +631,18 @@ async function buildTransferBalanceMetadata(
     }
     if (input.blockNumber > 0n) {
       if (fromBefore == null) {
-        fromBefore = await readBalanceAtBlock(input.tokenAddress, input.fromAddress, input.blockNumber - 1n)
+        fromBefore = await readBalanceAtBlock(
+          input.tokenAddress,
+          input.fromAddress,
+          input.blockNumber - 1n,
+        )
       }
       if (toBefore == null) {
-        toBefore = await readBalanceAtBlock(input.tokenAddress, input.toAddress, input.blockNumber - 1n)
+        toBefore = await readBalanceAtBlock(
+          input.tokenAddress,
+          input.toAddress,
+          input.blockNumber - 1n,
+        )
       }
     }
   }
@@ -578,17 +651,15 @@ async function buildTransferBalanceMetadata(
     return null
   }
 
-  const fromDelta = fromAfter - fromBefore
-  const toDelta = toAfter - toBefore
-
   return {
     reactivity_balance_from_before: fromBefore.toString(),
     reactivity_balance_from_after: fromAfter.toString(),
-    reactivity_balance_from_delta: fromDelta.toString(),
+    reactivity_balance_from_delta: (fromAfter - fromBefore).toString(),
     reactivity_balance_to_before: toBefore.toString(),
     reactivity_balance_to_after: toAfter.toString(),
-    reactivity_balance_to_delta: toDelta.toString(),
-    reactivity_balance_verified_with_simulation: input.simulationResults && input.simulationResults.length >= 4 ? 1 : 0,
+    reactivity_balance_to_delta: (toAfter - toBefore).toString(),
+    reactivity_balance_verified_with_simulation:
+      input.simulationResults && input.simulationResults.length >= 4 ? 1 : 0,
     reactivity_transfer_amount_raw: input.amountRaw?.toString() ?? '0',
   }
 }
@@ -604,12 +675,15 @@ async function maybeRecordShowcaseEvent(raw: ReactivityData): Promise<void> {
 
   const { error } = await supabase
     .from('reactivity_showcase_events')
-    .upsert({
-      tx_hash: raw.transactionHash.toLowerCase(),
-      event_contract: raw.address.toLowerCase(),
-      topic0: raw.topics[0].toLowerCase(),
-      block_number: Number(raw.blockNumber),
-    }, { onConflict: 'tx_hash' })
+    .upsert(
+      {
+        tx_hash: raw.transactionHash.toLowerCase(),
+        event_contract: raw.address.toLowerCase(),
+        topic0: raw.topics[0].toLowerCase(),
+        block_number: Number(raw.blockNumber),
+      },
+      { onConflict: 'tx_hash' },
+    )
 
   if (error) {
     console.error('[EventProcessor] Showcase event upsert error:', error.message)
@@ -630,15 +704,16 @@ async function upsertPostWithRetry(post: Record<string, unknown>) {
     } catch (error) {
       lastError = error
       const message = error instanceof Error ? error.message : String(error)
-      if (!message.toLowerCase().includes('fetch failed') || attempt === 3) {
-        break
-      }
+      if (!message.toLowerCase().includes('fetch failed') || attempt === 3) break
     }
     await sleep(attempt * 400)
   }
   return {
     data: null,
-    error: lastError instanceof Error ? { message: lastError.message } : { message: String(lastError ?? 'Unknown post upsert error') },
+    error:
+      lastError instanceof Error
+        ? { message: lastError.message }
+        : { message: String(lastError ?? 'Unknown post upsert error') },
   }
 }
 
@@ -661,16 +736,11 @@ async function getExistingPostSource(postIdHash: string): Promise<string | null>
 
 function sourcePriority(source: string): number {
   switch (source) {
-    case 'reactivity_spotlight':
-      return 4
-    case 'reactivity_wildcard':
-      return 3
-    case 'legacy_unknown':
-      return 2
-    case 'unknown':
-      return 1
+    case 'reactivity_spotlight': return 4
+    case 'reactivity_wildcard':  return 3
+    case 'legacy_unknown':       return 2
+    case 'unknown':              return 1
     case 'log_fallback':
-    default:
-      return 0
+    default:                     return 0
   }
 }

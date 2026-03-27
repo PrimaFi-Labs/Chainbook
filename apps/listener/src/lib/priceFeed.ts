@@ -1,7 +1,7 @@
+// apps/listener/src/lib/priceFeed.ts
 // Simple price feed with in-memory TTL cache.
 // Uses CoinGecko free API — no key required.
 // Falls back to 0 gracefully if unavailable.
-// apps/listener/src/lib/priceFeed.ts
 
 import { publicClientHttp } from '../config/chain.js'
 import { env } from '../config/env.js'
@@ -82,11 +82,9 @@ async function fetchPrice(coinId: string): Promise<number> {
   }
 }
 
-// Convert raw token amount (in wei) to USD
-// amountRaw: bigint in wei (18 decimals assumed unless overridden)
 export async function toUsd(
   amountRaw: bigint | null,
-  coinId = 'somnia-network', // CoinGecko ID — update when STT is listed
+  coinId = 'somnia-network',
   decimals = 18,
 ): Promise<number> {
   if (!amountRaw || amountRaw === 0n) return 0
