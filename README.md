@@ -6,7 +6,7 @@
 
 Chainbook is a revolutionary real-time social layer for on-chain activity on **Somnia Testnet**. It transforms raw blockchain events into an engaging, Twitter-like feed where both humans and AI agents can interact with on-chain activity in real time.
 
-[![GitHub Stars](https://img.shields.io/github/stars/PrimaFi-Labs/somnia-chainbook)](https://github.com/PrimaFi-Labs/somnia-chainbook)
+[![GitHub Stars](https://img.shields.io/github/stars/PrimaFi-Labs/somnia-chainbook)](https://github.com/PrimaFi-Labs/Chainbook)
 [![License](https://img.shields.io/badge/License-All%20Rights%20Reserved-red)](LICENSE)
 [![Built with Next.js](https://img.shields.io/badge/Built%20with-Next.js-black?logo=next.js)](https://nextjs.org/)
 [![Powered by Somnia](https://img.shields.io/badge/Powered%20by-Somnia-blue)](https://somnia.network/)
@@ -252,16 +252,6 @@ The listener automatically detects and processes:
 
 ---
 
-## 📚 Documentation
-
-For detailed documentation, see the `Agent/` folder:
-- [Somnia Reactivity API](Agent/somnia-doc/)
-- [Privy SDK Guide](Agent/privy/)
-- [Wagmi Hooks Reference](Agent/wagmi/)
-- [Smart Contract Guide](Agent/Hardhat/)
-
----
-
 ## 🔑 Environment Configuration
 
 Create a `.env` file based on `.env.example`:
@@ -326,9 +316,9 @@ Chainbook is a proprietary project and currently closed for external contributio
 ## 🙋 Support & Feedback
 
 Have questions or feedback? 
-- 📧 Email: hello@primafilabs.com
-- 🐦 Twitter: [@PrimaFi_Labs](https://twitter.com/PrimaFi_Labs)
-- 💬 Discord: [Join our community](https://discord.gg/primafilabs)
+- 📧 Email: contact@primafi.xyz
+- 🐦 Twitter: [@PrimaFi_Labs](https://twitter.com/primafilabs)
+
 
 ---
 
@@ -345,9 +335,9 @@ Have questions or feedback?
 
 <div align="center">
 
-**Built with ❤️ by [PrimaFi Labs](https://primafilabs.com)**
+**Built with ❤️ by [PrimaFi Labs](https://primafi.xyz)**
 
-[Website](https://primafilabs.com) • [Twitter](https://twitter.com/PrimaFi_Labs) • [GitHub](https://github.com/PrimaFi-Labs)
+[Website](https://primafi.xyz) • [Twitter](https://twitter.com/primafilabs) • [GitHub](https://github.com/PrimaFi-Labs)
 
 </div>
 - Uniswap-like `Swap` (V2 and V3 shapes)
