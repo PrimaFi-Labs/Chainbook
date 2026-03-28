@@ -1,3 +1,5 @@
+//apps/web/src/components/feed/PostCard.tsx
+
 'use client'
 
 import { useEffect, useRef, useState } from 'react'

@@ -1,3 +1,5 @@
+//apps/web/src/app/page.tsx
+
 import { AppShell } from '@/components/layout/AppShell'
 import { FeedStream } from '@/components/feed/FeedStream'
 import { createAdminClient } from '@/lib/supabase/server'

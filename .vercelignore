@@ -1,5 +1,0 @@
-apps/listener
-contracts
-.env
-.env.local
-.env.*.local

@@ -44,8 +44,6 @@ export const env = {
   LISTENER_BOOTSTRAP_BLOCKS:             Number(process.env.LISTENER_BOOTSTRAP_BLOCKS ?? '50'),
   LISTENER_POLL_INTERVAL_MS:             Number(process.env.LISTENER_POLL_INTERVAL_MS ?? '5000'),
   LISTENER_USE_WS:                       bool_env('LISTENER_USE_WS', true),
-  // How long (ms) to remember a processed block before allowing reprocessing.
-  // Prevents watchBlocks and the poll interval from double-processing the same block.
   LISTENER_BLOCK_DEDUP_TTL_MS:           Number(process.env.LISTENER_BLOCK_DEDUP_TTL_MS ?? '30000'),
   RPC_TIMEOUT_MS:                        Number(process.env.RPC_TIMEOUT_MS ?? '15000'),
   RPC_RETRY_COUNT:                       Number(process.env.RPC_RETRY_COUNT ?? '3'),
@@ -69,16 +67,33 @@ export const env = {
   MAX_CONCURRENT_RPC_CALLS:              Number(process.env.MAX_CONCURRENT_RPC_CALLS ?? '25'),
   MAX_CONCURRENT_DB_OPERATIONS:          Number(process.env.MAX_CONCURRENT_DB_OPERATIONS ?? '30'),
   PRICE_FEED_CACHE_TTL_MS:               Number(process.env.PRICE_FEED_CACHE_TTL_MS ?? '300000'),
-  ENABLE_WALLET_TOKEN_TRACKING:          bool_env('ENABLE_WALLET_TOKEN_TRACKING', false),
+
+  // ── Balance tracking (split into two flags) ────────────────────────────────
+  //
+  // ENABLE_NATIVE_BALANCE_TRACKING (default: true)
+  //   Re-enabled. One `eth_getBalance` RPC call per unique wallet per native
+  //   STT transfer. This feeds `wallet_balance_usd` which drives the
+  //   whale / shark / crab / shrimp labelling system. Low cost, high value.
+  ENABLE_NATIVE_BALANCE_TRACKING:        bool_env('ENABLE_NATIVE_BALANCE_TRACKING', true),
+
+  // ENABLE_TOKEN_HOLDING_TRACKING (default: false)
+  //   Kept disabled. Calls `balanceOf` for every ERC20 token involved in every
+  //   transfer event — very expensive at scale. Only enable if you need per-token
+  //   portfolio data in the frontend.
+  ENABLE_TOKEN_HOLDING_TRACKING:         bool_env('ENABLE_TOKEN_HOLDING_TRACKING', false),
+
   ENABLE_NOTIFICATIONS:                  bool_env('ENABLE_NOTIFICATIONS', false),
   NOTIFICATION_MIN_USD_THRESHOLD:        Number(process.env.NOTIFICATION_MIN_USD_THRESHOLD ?? '1000'),
-  // How long (ms) to cache post source lookups in memory before re-reading from DB.
-  // Eliminates the pre-upsert SELECT for duplicate events seen within this window.
   POST_SOURCE_CACHE_TTL_MS:              Number(process.env.POST_SOURCE_CACHE_TTL_MS ?? '120000'),
-  // Minimum whole-token amount for unpriced ERC20 transfers to be logged as posts.
-  // Transfers below this threshold are silently dropped. Does NOT affect MINT,
-  // SWAP, NFT_TRADE, LIQUIDITY_*, DAO_VOTE, or CONTRACT_DEPLOY events.
+
+  // ── Transfer noise filters ─────────────────────────────────────────────────
+  // Minimum whole-token amount for unpriced ERC20 transfers to be logged.
+  // Applied flat across all tokens regardless of decimals or price.
+  // Does NOT affect MINT, SWAP, NFT_TRADE, LIQUIDITY_*, DAO_VOTE, CONTRACT_DEPLOY.
   // STT-priced transfers use USD significance instead and bypass this check.
-   ERC20_TRANSFER_MIN_AMOUNT:             Number(process.env.ERC20_TRANSFER_MIN_AMOUNT ?? '1000'),
-   NATIVE_STT_MIN_AMOUNT:                 Number(process.env.NATIVE_STT_MIN_AMOUNT ?? '10'),
+  ERC20_TRANSFER_MIN_AMOUNT:             Number(process.env.ERC20_TRANSFER_MIN_AMOUNT ?? '1000'),
+
+  // Minimum native STT amount (whole tokens, not wei) for native transfers to
+  // be logged as posts. Filters dust and micro-test transactions.
+  NATIVE_STT_MIN_AMOUNT:                 Number(process.env.NATIVE_STT_MIN_AMOUNT ?? '10'),
 } as const
