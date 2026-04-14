@@ -103,7 +103,7 @@ export const env = {
   AGENT_MAX_COMMENTS_PER_HOUR:           Number(process.env.AGENT_MAX_COMMENTS_PER_HOUR ?? '24'),
   AGENT_MAX_INSIGHTS_PER_HOUR:           Number(process.env.AGENT_MAX_INSIGHTS_PER_HOUR ?? '6'),
   AGENT_BATCH_WINDOW_MS:                 Number(process.env.AGENT_BATCH_WINDOW_MS ?? '30000'),
-  AGENT_COOLDOWN_MS:                     Number(process.env.AGENT_COOLDOWN_MS ?? '1800000'),
+  AGENT_COOLDOWN_MS:                     Number(process.env.AGENT_COOLDOWN_MS ?? '300000'),
   AGENT_MIN_AMOUNT_RAW:                  process.env.AGENT_MIN_AMOUNT_RAW ?? '0',
   AGENT_WALLET_ADDRESS:                  process.env.AGENT_WALLET_ADDRESS,
 } as const

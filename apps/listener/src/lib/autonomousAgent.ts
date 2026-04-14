@@ -26,6 +26,13 @@ const CFG = {
   maxRounds: 2,
 }
 
+const NON_TRANSFER_PRIORITY_TYPES = new Set([
+  'MINT',
+  'NFT_TRADE',
+  'CONTRACT_DEPLOY',
+  'DAO_VOTE',
+])
+
 interface RawPost {
   id?: string
   type?: string
@@ -166,7 +173,10 @@ function consumeWrite(kind: 'comment' | 'insight') {
 const cooldowns = new Map<string, number>()
 
 function isOnCooldown(post: NormedPost): boolean {
-  const keys = [post.contract_address, post.token_in, post.token_out].filter(Boolean) as string[]
+  if (NON_TRANSFER_PRIORITY_TYPES.has(post.type)) return false
+  const keys = [post.contract_address, post.token_in, post.token_out]
+    .filter(Boolean)
+    .map((key) => `${post.type}:${String(key).toLowerCase()}`) as string[]
   const now = Date.now()
 
   return keys.some((key) => {
@@ -176,9 +186,10 @@ function isOnCooldown(post: NormedPost): boolean {
 }
 
 function setCooldown(post: NormedPost) {
+  if (NON_TRANSFER_PRIORITY_TYPES.has(post.type)) return
   const keys = [post.contract_address, post.token_in, post.token_out].filter(Boolean) as string[]
   const now = Date.now()
-  keys.forEach((key) => cooldowns.set(key.toLowerCase(), now))
+  keys.forEach((key) => cooldowns.set(`${post.type}:${key.toLowerCase()}`, now))
 }
 
 const commentedPosts = new Set<string>()
@@ -205,7 +216,12 @@ function compactText(text: string): string {
 }
 
 function hasEvidence(text: string): boolean {
-  return /\$[\d,.]+/.test(text) || /\b\d+(\.\d+)?%/.test(text) || /0x[a-fA-F0-9]{6,}/.test(text)
+  return (
+    /\$[\d,.]+/.test(text) ||
+    /\b\d+(\.\d+)?%/.test(text) ||
+    /0x[a-fA-F0-9]{6,}/.test(text) ||
+    /\b\d[\d,]*(\.\d+)?\b/.test(text)
+  )
 }
 
 function hasUnsafeTone(text: string): boolean {
@@ -243,17 +259,28 @@ async function flushBatch(batch: NormedPost[]) {
     return b.significance_score - a.significance_score
   })
 
-  const top3 = ranked.slice(0, 3)
-  console.log(`[AutonomousAgent] Batch: ${batch.length} events -> processing top ${top3.length}`)
+  const processCap = Math.min(
+    Math.max(Math.floor(CFG.maxCallsPerMinute * 0.75), 3),
+    Math.max(ranked.length, 3),
+  )
+  console.log(`[AutonomousAgent] Batch: ${batch.length} events -> target up to ${processCap}`)
 
-  for (const post of top3) {
+  let processed = 0
+  for (const post of ranked) {
+    if (processed >= processCap) break
+    if (isOnCooldown(post)) {
+      console.log(`[AutonomousAgent] Cooldown active for post ${post.id} - skipping`)
+      continue
+    }
     await processPost(post)
+    processed += 1
     await sleep(2_000)
   }
 }
 
 function isSignificant(post: NormedPost): boolean {
   if (post.type === 'AGENT_INSIGHT') return false
+  if (NON_TRANSFER_PRIORITY_TYPES.has(post.type)) return true
   return post.is_whale_alert || post.amount_raw >= CFG.minAmountRaw
 }
 
@@ -418,15 +445,18 @@ function makeExecutor() {
 
             const { data: sourcePost } = await supabase
               .from('posts')
-              .select('id, type, tx_hash, wallet_address, amount_usd, is_whale_alert, token_in, contract_address')
+              .select('id, type, tx_hash, wallet_address, amount_usd, is_whale_alert, significance_score, token_in, contract_address')
               .eq('id', sourceId)
               .single()
 
             const sourceIsWhale = (sourcePost as RawPost | null)?.is_whale_alert === true
-            if (!sourcePost || !sourceIsWhale) {
+            const sourceType = String((sourcePost as RawPost | null)?.type ?? '')
+            const sourceScore = Number((sourcePost as RawPost | null)?.significance_score ?? 0)
+            const sourceIsHighSignalType = NON_TRANSFER_PRIORITY_TYPES.has(sourceType)
+            if (!sourcePost || (!sourceIsWhale && !sourceIsHighSignalType && sourceScore < 25)) {
               result = {
                 skipped: true,
-                reason: 'insight requires whale source post',
+                reason: 'insight requires whale, high-signal type, or significant source post',
               }
               break
             }
@@ -496,12 +526,14 @@ const SYSTEM_PROMPT =
   `You are Chainbook AI on Somnia Network. Analyse the on-chain event and respond.\n\n` +
   `Steps:\n` +
   `1. Call get_event_context.\n` +
-  `2. For whale events, call estimate_price_impact.\n` +
+  `2. For swaps/transfers/LP events, call estimate_price_impact when useful.\n` +
   `3. Call post_comment with 2 sentences max (specific numbers, 280 chars max).\n` +
-  `4. Only call post_insight if: is_whale_alert=true AND severity is HIGH or CRITICAL.\n\n` +
-  `Comment format: "[tier] wallet moved $X - [severity] Y% estimated impact."\n` +
+  `4. Call post_insight for major whale events OR standout MINT/NFT_TRADE/CONTRACT_DEPLOY events with concrete evidence.\n\n` +
+  `Comment format by event:\n` +
+  `- SWAP/TRANSFER/LIQUIDITY: include value/impact.\n` +
+  `- MINT/NFT_TRADE/CONTRACT_DEPLOY/DAO_VOTE: include event type, wallet/contract, and concrete on-chain details.\n` +
   `Guardrails:\n` +
-  `- Include evidence in every output ($ amounts, % impact, or 0x addresses).\n` +
+  `- Include evidence in every output (amounts, %, tx hash, or 0x addresses).\n` +
   `- No abusive language, personal attacks, or defamatory claims.\n` +
   `- No financial advice ("buy now", "sell now", "you should buy").\n` +
   `- Keep tone sharp but factual.\n` +
@@ -513,11 +545,6 @@ async function processPost(post: NormedPost): Promise<void> {
 
   if (budget === 'whale_only' && !post.is_whale_alert) {
     console.log(`[AutonomousAgent] Budget at 80% - skipping non-whale post ${post.id}`)
-    return
-  }
-
-  if (isOnCooldown(post)) {
-    console.log(`[AutonomousAgent] Cooldown active for post ${post.id} - skipping`)
     return
   }
 
