@@ -531,6 +531,7 @@ function calculateSignificanceScore(
     LIQUIDITY_REMOVE: 6,
     CONTRACT_DEPLOY: 6,
     NFT_TRADE: 7,
+    AGENT_INSIGHT: 5,
   }
   const whaleBonus = isWhaleAlert ? 20 : 0
   return Number((base + (typeBonus[postType] ?? 0) + whaleBonus).toFixed(2))

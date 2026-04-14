@@ -141,7 +141,7 @@ export function FeedStream({ initialPosts }: FeedStreamProps) {
       if (logs.length === 0) return
       const postIdHashes = logs
         .map((log) => (typeof log.args.postId === 'string' ? log.args.postId : null))
-        .filter((value): value is string => !!value)
+        .filter((value): value is `0x${string}` => value !== null)
       applyLikeDelta(postIdHashes, 1)
     },
   })
@@ -155,7 +155,7 @@ export function FeedStream({ initialPosts }: FeedStreamProps) {
       if (logs.length === 0) return
       const postIdHashes = logs
         .map((log) => (typeof log.args.postId === 'string' ? log.args.postId : null))
-        .filter((value): value is string => !!value)
+        .filter((value): value is `0x${string}` => value !== null)
       applyLikeDelta(postIdHashes, -1)
     },
   })
