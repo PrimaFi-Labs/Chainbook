@@ -13,25 +13,15 @@ import {
 export const agentEventBus = new EventEmitter()
 agentEventBus.setMaxListeners(10)
 
-const E = env as Record<string, unknown>
-
-function envNumber(key: string, fallback: number): number {
-  const raw = E[key]
-  const value = Number(raw)
-  return Number.isFinite(value) ? value : fallback
-}
-
 const CFG = {
-  minUsd: envNumber('AGENT_MIN_USD', 10_000),
-  minScore: envNumber('AGENT_MIN_SCORE', 20),
-  dailyBudget: envNumber('AGENT_DAILY_BUDGET', 80),
-  maxCallsPerMinute: envNumber('AGENT_MAX_CALLS_PER_MINUTE', 4),
-  maxCommentsPerHour: envNumber('AGENT_MAX_COMMENTS_PER_HOUR', 24),
-  maxInsightsPerHour: envNumber('AGENT_MAX_INSIGHTS_PER_HOUR', 6),
-  batchWindowMs: envNumber('AGENT_BATCH_WINDOW_MS', 30_000),
-  cooldownMs: envNumber('AGENT_COOLDOWN_MS', 1_800_000),
-  agentWallet: String(E.AGENT_WALLET_ADDRESS ?? '0x00chainbookai'),
-  insightMinUsd: 50_000,
+  dailyBudget: env.AGENT_DAILY_BUDGET,
+  maxCallsPerMinute: env.AGENT_MAX_CALLS_PER_MINUTE,
+  maxCommentsPerHour: env.AGENT_MAX_COMMENTS_PER_HOUR,
+  maxInsightsPerHour: env.AGENT_MAX_INSIGHTS_PER_HOUR,
+  batchWindowMs: env.AGENT_BATCH_WINDOW_MS,
+  cooldownMs: env.AGENT_COOLDOWN_MS,
+  minAmountRaw: BigInt(env.AGENT_MIN_AMOUNT_RAW),
+  agentWallet: String(env.AGENT_WALLET_ADDRESS ?? '0x00chainbookai'),
   maxTokens: 256,
   maxRounds: 2,
 }
@@ -41,6 +31,7 @@ interface RawPost {
   type?: string
   wallet_address?: string | null
   amount_usd?: number | string | null
+  amount_raw?: string | null
   is_whale_alert?: boolean | null
   significance_score?: number | string | null
   tx_hash?: string
@@ -58,6 +49,7 @@ interface NormedPost {
   type: string
   wallet_address: string
   amount_usd: number
+  amount_raw: bigint
   is_whale_alert: boolean
   significance_score: number
   tx_hash: string
@@ -74,6 +66,7 @@ function normalize(raw: RawPost): NormedPost | null {
     type: String(raw.type ?? 'UNKNOWN'),
     wallet_address: String(raw.wallet_address ?? ''),
     amount_usd: Number(raw.amount_usd ?? 0),
+    amount_raw: toBigInt(raw.amount_raw),
     is_whale_alert: raw.is_whale_alert === true,
     significance_score: Number(raw.significance_score ?? 0),
     tx_hash: String(raw.tx_hash ?? ''),
@@ -261,7 +254,7 @@ async function flushBatch(batch: NormedPost[]) {
 
 function isSignificant(post: NormedPost): boolean {
   if (post.type === 'AGENT_INSIGHT') return false
-  return post.is_whale_alert || post.amount_usd >= CFG.minUsd || post.significance_score >= CFG.minScore
+  return post.is_whale_alert || post.amount_raw >= CFG.minAmountRaw
 }
 
 const TOOLS: ToolDefinition[] = [
@@ -302,7 +295,7 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: 'post_insight',
-    description: 'Publish an AGENT_INSIGHT post. Only for whale events above $50k with HIGH/CRITICAL impact.',
+    description: 'Publish an AGENT_INSIGHT post only for whale events with high or critical estimated impact.',
     parameters: {
       type: 'object',
       properties: {
@@ -429,12 +422,11 @@ function makeExecutor() {
               .eq('id', sourceId)
               .single()
 
-            const sourceAmountUsd = Number((sourcePost as RawPost | null)?.amount_usd ?? 0)
             const sourceIsWhale = (sourcePost as RawPost | null)?.is_whale_alert === true
-            if (!sourcePost || !sourceIsWhale || sourceAmountUsd < CFG.insightMinUsd) {
+            if (!sourcePost || !sourceIsWhale) {
               result = {
                 skipped: true,
-                reason: `insight requires whale source and amount >= $${CFG.insightMinUsd}`,
+                reason: 'insight requires whale source post',
               }
               break
             }
@@ -471,7 +463,7 @@ function makeExecutor() {
                   source_post_type: (sourcePost as RawPost).type ?? null,
                   source_post_tx_hash: (sourcePost as RawPost).tx_hash ?? null,
                   source_post_wallet: (sourcePost as RawPost).wallet_address ?? null,
-                  source_post_amount_usd: sourceAmountUsd,
+                  source_post_amount_usd: Number((sourcePost as RawPost | null)?.amount_usd ?? 0),
                   source_post_token: (sourcePost as RawPost).token_in ?? (sourcePost as RawPost).contract_address ?? null,
                   guardrails: {
                     requires_evidence: true,
@@ -504,9 +496,9 @@ const SYSTEM_PROMPT =
   `You are Chainbook AI on Somnia Network. Analyse the on-chain event and respond.\n\n` +
   `Steps:\n` +
   `1. Call get_event_context.\n` +
-  `2. If whale or amount > $10k, call estimate_price_impact.\n` +
+  `2. For whale events, call estimate_price_impact.\n` +
   `3. Call post_comment with 2 sentences max (specific numbers, 280 chars max).\n` +
-  `4. Only call post_insight if: is_whale_alert=true AND amount > $50k AND severity is HIGH or CRITICAL.\n\n` +
+  `4. Only call post_insight if: is_whale_alert=true AND severity is HIGH or CRITICAL.\n\n` +
   `Comment format: "[tier] wallet moved $X - [severity] Y% estimated impact."\n` +
   `Guardrails:\n` +
   `- Include evidence in every output ($ amounts, % impact, or 0x addresses).\n` +
@@ -546,10 +538,10 @@ async function processPost(post: NormedPost): Promise<void> {
     {
       role: 'user',
       content:
-        `Event: post_id=${post.id} type=${post.type} ` +
-        `whale=${post.is_whale_alert} usd=$${post.amount_usd} ` +
-        `score=${post.significance_score} from=${post.wallet_address || 'unknown'} ` +
-        `token=${post.token_in ?? post.contract_address ?? 'unknown'}`,
+      `Event: post_id=${post.id} type=${post.type} ` +
+      `whale=${post.is_whale_alert} usd=$${post.amount_usd} ` +
+      `amount_raw=${post.amount_raw.toString()} score=${post.significance_score} from=${post.wallet_address || 'unknown'} ` +
+      `token=${post.token_in ?? post.contract_address ?? 'unknown'}`,
     },
   ]
 
@@ -581,10 +573,9 @@ export async function startAutonomousAgent(): Promise<void> {
 
   console.log(
     '[AutonomousAgent] Ready\n' +
-      `  provider    = ${String(E.AGENT_PROVIDER ?? 'anthropic')}\n` +
-      `  model       = ${String(E.AGENT_MODEL ?? '(default - cheapest for provider)')}\n` +
-      `  min_usd     = $${CFG.minUsd}\n` +
-      `  min_score   = ${CFG.minScore}\n` +
+      `  provider    = ${String(env.AGENT_PROVIDER ?? 'anthropic')}\n` +
+      `  model       = ${String(env.AGENT_MODEL ?? '(default - cheapest for provider)')}\n` +
+      `  min_amount_raw = ${CFG.minAmountRaw.toString()} (base units)\n` +
       `  daily_budget= ${CFG.dailyBudget} calls/day\n` +
       `  comments/hr = ${CFG.maxCommentsPerHour}\n` +
       `  insights/hr = ${CFG.maxInsightsPerHour}\n` +
@@ -595,4 +586,17 @@ export async function startAutonomousAgent(): Promise<void> {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function toBigInt(value: unknown): bigint {
+  if (typeof value === 'bigint') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value))
+  if (typeof value === 'string' && value.trim() !== '') {
+    try {
+      return BigInt(value)
+    } catch {
+      return 0n
+    }
+  }
+  return 0n
 }

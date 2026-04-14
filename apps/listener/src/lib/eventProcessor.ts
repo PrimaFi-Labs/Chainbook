@@ -689,7 +689,7 @@ async function upsertPostWithRetry(post: Record<string, unknown>) {
       const result = await supabase
         .from('posts')
         .upsert(post, { onConflict: 'post_id_hash' })
-        .select('id')
+        .select('*')
         .single()
       if (!result.error) return result
       lastError = result.error

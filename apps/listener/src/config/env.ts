@@ -93,4 +93,17 @@ export const env = {
   // ── Transfer noise filters ─────────────────────────────────────────────────
   ERC20_TRANSFER_MIN_AMOUNT:             Number(process.env.ERC20_TRANSFER_MIN_AMOUNT ?? '1000'),
   NATIVE_STT_MIN_AMOUNT:                 Number(process.env.NATIVE_STT_MIN_AMOUNT ?? '10'),
+
+  // Autonomous agent
+  AGENT_PROVIDER:                        process.env.AGENT_PROVIDER,
+  AGENT_MODEL:                           process.env.AGENT_MODEL,
+  AGENT_API_KEY:                         process.env.AGENT_API_KEY,
+  AGENT_DAILY_BUDGET:                    Number(process.env.AGENT_DAILY_BUDGET ?? '80'),
+  AGENT_MAX_CALLS_PER_MINUTE:            Number(process.env.AGENT_MAX_CALLS_PER_MINUTE ?? '4'),
+  AGENT_MAX_COMMENTS_PER_HOUR:           Number(process.env.AGENT_MAX_COMMENTS_PER_HOUR ?? '24'),
+  AGENT_MAX_INSIGHTS_PER_HOUR:           Number(process.env.AGENT_MAX_INSIGHTS_PER_HOUR ?? '6'),
+  AGENT_BATCH_WINDOW_MS:                 Number(process.env.AGENT_BATCH_WINDOW_MS ?? '30000'),
+  AGENT_COOLDOWN_MS:                     Number(process.env.AGENT_COOLDOWN_MS ?? '1800000'),
+  AGENT_MIN_AMOUNT_RAW:                  process.env.AGENT_MIN_AMOUNT_RAW ?? '0',
+  AGENT_WALLET_ADDRESS:                  process.env.AGENT_WALLET_ADDRESS,
 } as const
